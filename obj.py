@@ -47,11 +47,11 @@ st.set_page_config(
 # 1. REPLACE YOUR load_model FUNCTION WITH THIS:
 @st.cache(allow_output_mutation=True)
 def load_model():
-    # Use the Faster R-CNN version available in Torchvision 0.9.1
-    # This is a robust model for person detection on the Jetson Nano
-    model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn(pretrained=True)
+    # Use the version available in Torchvision 0.9.1
+    # Note: 'pretrained=True' is the correct flag for your version
+    model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=True)
     
-    # Crucial: .eval() must be on its own line
+    # Put .eval() on a new line to keep Streamlit's hasher happy
     model.eval()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
