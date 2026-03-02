@@ -44,47 +44,62 @@ st.set_page_config(
     layout="wide"
 )
 
-# Load PyTorch Native SSD Model (NO ULTRALYTICS NEEDED)
+# 1. REPLACE YOUR load_model FUNCTION WITH THIS:
 @st.cache(allow_output_mutation=True)
 def load_model():
-    # Load a lightweight, fast model built right into PyTorch
+    # This loads a model that is ALREADY on your Jetson. No downloading from 'ultralytics'
     model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(pretrained=True)
-    model.eval() # Set to evaluation mode
-    
-    # Move to GPU if available
+    model.eval()
     if torch.cuda.is_available():
         model = model.cuda()
     return model
 
-# Function to process frame
+# 2. REPLACE YOUR process_frame FUNCTION WITH THIS:
 def process_frame(frame, model, restricted_area, people_counter):
     if frame is None:
         return None, False
-        
-    # Convert frame to RGB for processing
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    # Prepare image for PyTorch
-    transform = T.Compose([T.ToTensor()])
-    img_tensor = transform(rgb_frame)
+    # Prepare image
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_tensor = T.ToTensor()(img_rgb)
     if torch.cuda.is_available():
         img_tensor = img_tensor.cuda()
     
-    # Run inference
+    # Run Inference
     with torch.no_grad():
+        # SSD models expect a list of tensors
         predictions = model([img_tensor])
-        
-    # Extract data from predictions
-    boxes = predictions[0]['boxes'].cpu().numpy()
-    labels = predictions[0]['labels'].cpu().numpy()
-    scores = predictions[0]['scores'].cpu().numpy()
     
-    intrusion_detected = False
+    # SSD returns: boxes, labels, scores
+    pred_boxes = predictions[0]['boxes'].cpu().numpy()
+    pred_labels = predictions[0]['labels'].cpu().numpy()
+    pred_scores = predictions[0]['scores'].cpu().numpy()
+    
     people_count = 0
-    
-    # Draw restricted area (Red box)
+    intrusion_detected = False
+
+    # Draw restricted area
     cv2.rectangle(frame, (int(restricted_area[0]), int(restricted_area[1])), 
                  (int(restricted_area[2]), int(restricted_area[3])), (0, 0, 255), 2)
+
+    for i in range(len(pred_labels)):
+        # In COCO dataset (which this model uses), Class 1 is "Person"
+        if pred_labels[i] == 1 and pred_scores[i] > 0.5:
+            people_count += 1
+            x1, y1, x2, y2 = pred_boxes[i].astype(int)
+            
+            # Draw person box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Check for intrusion
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if (restricted_area[0] < cx < restricted_area[2] and 
+                restricted_area[1] < cy < restricted_area[3]):
+                intrusion_detected = True
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
+    people_counter['count'] = people_count
+    return frame, intrusion_detected
     
     # Loop through detections
     for i in range(len(boxes)):
