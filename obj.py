@@ -1,6 +1,8 @@
 import streamlit as st
 import cv2
 import torch
+import torchvision
+import torchvision.transforms as T
 import numpy as np
 import time
 from threading import Thread
@@ -42,64 +44,75 @@ st.set_page_config(
     layout="wide"
 )
 
-# Load YOLOv5 model (Optimized for Jetson GPU)
-@st.cache_resource
+# Load PyTorch Native SSD Model (NO ULTRALYTICS NEEDED)
+@st.cache(allow_output_mutation=True)
 def load_model():
-    # Check for CUDA to leverage Jetson Nano's GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, device=device)
-    model.classes = [0]  # Filter for people only (class 0)
+    # Load a lightweight, fast model built right into PyTorch
+    model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(pretrained=True)
+    model.eval() # Set to evaluation mode
+    
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        model = model.cuda()
     return model
 
-# Function to process frame with YOLOv5
+# Function to process frame
 def process_frame(frame, model, restricted_area, people_counter):
     if frame is None:
         return None, False
         
-    # Convert frame to RGB for YOLOv5
+    # Convert frame to RGB for processing
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
+    # Prepare image for PyTorch
+    transform = T.Compose([T.ToTensor()])
+    img_tensor = transform(rgb_frame)
+    if torch.cuda.is_available():
+        img_tensor = img_tensor.cuda()
+    
     # Run inference
-    results = model(rgb_frame)
+    with torch.no_grad():
+        predictions = model([img_tensor])
+        
+    # Extract data from predictions
+    boxes = predictions[0]['boxes'].cpu().numpy()
+    labels = predictions[0]['labels'].cpu().numpy()
+    scores = predictions[0]['scores'].cpu().numpy()
     
-    # Get detections
-    detections = results.pandas().xyxy[0]
-    
-    # Filter for people (class 0)
-    people_detections = detections[detections['class'] == 0]
-    
-    # Count people
-    people_count = len(people_detections)
-    people_counter['count'] = people_count
-    
-    # Draw bounding boxes and check for restricted area intrusion
     intrusion_detected = False
+    people_count = 0
     
     # Draw restricted area (Red box)
-    cv2.rectangle(frame, (restricted_area[0], restricted_area[1]), 
-                 (restricted_area[2], restricted_area[3]), (0, 0, 255), 2)
+    cv2.rectangle(frame, (int(restricted_area[0]), int(restricted_area[1])), 
+                 (int(restricted_area[2]), int(restricted_area[3])), (0, 0, 255), 2)
     
-    for _, detection in people_detections.iterrows():
-        # Get bounding box coordinates
-        x1, y1, x2, y2 = int(detection['xmin']), int(detection['ymin']), int(detection['xmax']), int(detection['ymax'])
-        
-        # Draw bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Add label
-        conf = detection['confidence']
-        label = f"Person: {conf:.2f}"
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-        # Check if person is in restricted area
-        person_center_x = (x1 + x2) // 2
-        person_center_y = (y1 + y2) // 2
-        
-        if (restricted_area[0] < person_center_x < restricted_area[2] and 
-            restricted_area[1] < person_center_y < restricted_area[3]):
-            intrusion_detected = True
-            # Highlight the intruding person with a red box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+    # Loop through detections
+    for i in range(len(boxes)):
+        # Check if it's a Person (COCO class 1) and confidence > 50%
+        if labels[i] == 1 and scores[i] > 0.50:
+            people_count += 1
+            
+            # Get bounding box coordinates
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Add label
+            label = f"Person: {scores[i]:.2f}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Check if person is in restricted area
+            person_center_x = (x1 + x2) // 2
+            person_center_y = (y1 + y2) // 2
+            
+            if (restricted_area[0] < person_center_x < restricted_area[2] and 
+                restricted_area[1] < person_center_y < restricted_area[3]):
+                intrusion_detected = True
+                # Highlight the intruding person with a red box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+    
+    people_counter['count'] = people_count
     
     # Add people count to frame
     cv2.putText(frame, f"People Count: {people_count}", (10, 30), 
@@ -110,20 +123,12 @@ def process_frame(frame, model, restricted_area, people_counter):
 def main():
     st.title("Smart Imaging Dashboard")
     
-    # Sidebar configuration
     st.sidebar.title("Settings")
     
-    # USB camera index selection
     usb_camera_index = st.sidebar.number_input(
-        "USB Camera Index",
-        min_value=0,
-        max_value=10,
-        value=0, # Usually 0 for the first connected USB webcam
-        step=1,
-        help="If 0 fails, try 1 or 2 depending on your Jetson's /dev/video* mappings."
+        "USB Camera Index", min_value=0, max_value=10, value=0, step=1
     )
     
-    # Define restricted area (default values)
     st.sidebar.subheader("Restricted Area Settings")
     col1, col2 = st.sidebar.columns(2)
     with col1:
@@ -135,65 +140,47 @@ def main():
     
     restricted_area = [x1, y1, x2, y2]
     
-    # Load model
-    with st.spinner("Loading YOLOv5 model..."):
+    with st.spinner("Loading AI Model (No Ultralytics needed!)..."):
         model = load_model()
         st.sidebar.success("Model loaded successfully!")
     
-    # Initialize people counter
     people_counter = {'count': 0}
-    
-    # Create placeholder for video feed
     video_placeholder = st.empty()
     
-    # Create metrics placeholders
     col1, col2 = st.columns(2)
     people_count_metric = col1.metric("People Count", 0)
     status_metric = col2.metric("Status", "Safe")
     
-    # Initialize camera using threaded video capture
     video_stream = VideoStream(src=usb_camera_index, resolution=(640, 480)).start()
-    
-    # Give the camera sensor time to warm up
     time.sleep(2.0)
     
-    # Start streaming
     try:
         while True:
-            # Get frame from threaded video stream
             frame = video_stream.read()
             
             if frame is None:
-                st.error(f"Error: Failed to capture image from camera (index: {usb_camera_index}).")
-                st.info("Check if your USB webcam is plugged in and recognized via 'ls -l /dev/video*'.")
-                break
-            
-            # Process frame
+                st.error(f"Camera Error on index {usb_camera_index}. Waiting...")
+                time.sleep(1)
+                continue
+                
             processed_frame, intrusion_detected = process_frame(frame, model, restricted_area, people_counter)
             
-            # Update metrics
             people_count_metric.metric("People Count", people_counter['count'])
             
-            # Update visual status metric for intrusions
             if intrusion_detected:
                 status_metric.metric("Status", "⚠️ INTRUSION DETECTED", delta="- Alert")
             else:
                 status_metric.metric("Status", "Safe", delta=None)
             
-            # Convert to RGB for Streamlit display
             processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-            
-            # Display the frame
             video_placeholder.image(processed_frame_rgb, channels="RGB", use_container_width=True)
             
-            # Small delay to reduce CPU usage
             time.sleep(0.01)
             
     except Exception as e:
-        st.error(f"Error during video processing: {e}")
+        st.error(f"Stream interrupted. Please refresh.")
         
     finally:
-        # Release resources safely on exit
         video_stream.stop()
 
 if __name__ == "__main__":
