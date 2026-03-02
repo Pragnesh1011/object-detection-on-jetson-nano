@@ -47,12 +47,12 @@ st.set_page_config(
 # 1. REPLACE YOUR load_model FUNCTION WITH THIS:
 @st.cache(allow_output_mutation=True)
 def load_model():
-    # This loads a model that is ALREADY on your Jetson. No downloading from 'ultralytics'
-    model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(pretrained=True)
+    # This version is compatible with Torchvision 0.9.1
+    model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn(pretrained=True)
     model.eval()
-    if torch.cuda.is_available():
-        model = model.cuda()
-    return model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return model, device
 
 # 2. REPLACE YOUR process_frame FUNCTION WITH THIS:
 def process_frame(frame, model, restricted_area, people_counter):
