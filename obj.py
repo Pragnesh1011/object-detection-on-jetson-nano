@@ -47,9 +47,13 @@ st.set_page_config(
 # 1. REPLACE YOUR load_model FUNCTION WITH THIS:
 @st.cache(allow_output_mutation=True)
 def load_model():
-    # This version is compatible with Torchvision 0.9.1
+    # Use the Faster R-CNN version available in Torchvision 0.9.1
+    # This is a robust model for person detection on the Jetson Nano
     model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn(pretrained=True)
+    
+    # Crucial: .eval() must be on its own line
     model.eval()
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     return model, device
