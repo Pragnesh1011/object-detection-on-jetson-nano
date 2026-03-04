@@ -1,0 +1,132 @@
+import streamlit as st
+import cv2
+import numpy as np
+from hailo_platform import HEF, VDevice, HailoStreamInterface, InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType
+import time
+import psutil
+import csv
+
+# --- RESEARCH DATA LOGGING SETUP ---
+log_file = open('pi_research_stats.csv', mode='w', newline='')
+log_writer = csv.writer(log_file)
+log_writer.writerow(['Time', 'FPS', 'CPU_Usage', 'RAM_Usage'])
+start_session = time.time()
+
+# --- STREAMLIT UI SETUP ---
+st.set_page_config(page_title="Pi Proximity Research", layout="wide")
+st.title("🚀 Raspberry Pi Proximity-Entry Research (Hailo NPU)")
+st.sidebar.header("System Metrics")
+st_fps = st.sidebar.empty()
+st_cpu = st.sidebar.empty()
+
+col1, col2 = st.columns([3, 1])
+frame_placeholder = col1.empty()
+status_placeholder = col2.empty()
+
+# --- HAILO NPU INITIALIZATION ---
+try:
+    hef_path = "yolov8n.hef"
+    hef = HEF(hef_path)
+    
+    # Claim the Hailo Virtual Device
+    target = VDevice()
+    configure_params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
+    network_group = target.configure(hef, configure_params)[0]
+    
+    input_vparams = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+    output_vparams = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+    
+    input_name = list(input_vparams.keys())[0]
+    
+except Exception as e:
+    st.error(f"Error communicating with AI HAT: {e}")
+    st.stop()
+
+cap = cv2.VideoCapture(0)
+
+try:
+    # --- WAKE UP THE NPU ---
+    with network_group.activate():
+        with InferVStreams(network_group, input_vparams, output_vparams) as infer_pipeline:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: break
+
+                h_orig, w_orig = frame.shape[:2]
+                
+                # --- PRE-PROCESSING ---
+                input_img = cv2.resize(frame, (640, 640))
+                input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+                
+                # Numpy-safe float conversion
+                input_img = input_img.astype('float32') / 255.0
+                input_data = {input_name: np.expand_dims(input_img, axis=0)}
+
+                # --- NPU INFERENCE ---
+                inf_start = time.time()
+                output = infer_pipeline.infer(input_data)
+                latency = (time.time() - inf_start) * 1000
+                fps = 1000 / latency if latency > 0 else 0
+
+                # --- DECODING ---
+                raw_output = list(output.values())[0]
+                
+                # FIX: Extract the array from Hailo's batch list wrapper
+                if isinstance(raw_output, list):
+                    raw_output = raw_output[0]
+                
+                # Guarantee it is a NumPy array so .shape works
+                raw_output = np.array(raw_output)
+                
+                best_boxes = []
+                
+                # Check for the raw YOLOv8 tensor output (84 x 8400)
+                if len(raw_output.shape) == 3 and raw_output.shape[1] == 84:
+                    raw_output = np.squeeze(raw_output).T
+                    boxes = raw_output[:, :4]
+                    scores = raw_output[:, 4:]
+                    class_ids = np.argmax(scores, axis=1)
+                    confidences = np.max(scores, axis=1)
+                    
+                    mask = (confidences > 0.4) & (class_ids == 0) # Class 0 = Person
+                    best_boxes = boxes[mask]
+                else:
+                    # If Hailo baked their own NMS into the model, log the new shape
+                    print(f"DEBUG - Unexpected Tensor Shape: {raw_output.shape}")
+
+                entry_status = "❌ LOCKED"
+                status_color = (255, 0, 0)
+
+                for cx, cy, bw, bh in best_boxes:
+                    x1 = int((cx - bw/2) * w_orig)
+                    y1 = int((cy - bh/2) * h_orig)
+                    box_w = int(bw * w_orig)
+                    box_h = int(bh * h_orig)
+
+                    # Proximity Logic: Person fills > 50% of the screen height
+                    if box_h > (h_orig * 0.5):
+                        entry_status = "✅ ENTRY GRANTED"
+                        status_color = (0, 255, 0)
+                    
+                    cv2.rectangle(frame, (x1, y1), (x1 + box_w, y1 + box_h), status_color, 3)
+
+                # --- TELEMETRY & LOGGING ---
+                curr_time = time.time() - start_session
+                cpu_u = psutil.cpu_percent()
+                ram_u = psutil.virtual_memory().percent
+                log_writer.writerow([curr_time, fps, cpu_u, ram_u])
+
+                # --- UPDATE UI ---
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(frame_rgb, channels="RGB")
+                status_placeholder.markdown(f"## {entry_status}")
+                st_fps.metric("Inference Speed", f"{fps:.1f} FPS")
+                st_cpu.metric("CPU Load", f"{cpu_u}%")
+
+except Exception as e:
+    print(f"Session ended or error occurred: {e}")
+
+finally:
+    cap.release()
+    log_file.close()
+    target.release()
